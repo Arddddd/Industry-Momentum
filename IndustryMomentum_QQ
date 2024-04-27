@@ -1,0 +1,273 @@
+import pandas as pd
+import numpy as np
+
+
+# def get_rawdata():
+#     # 量价数据
+#     datalist = os.listdir('aindexeodprices')
+#     df = pd.DataFrame()
+#     for i in datalist:
+#         temp = pd.read_hdf('aindexeodprices' + '\\' + i)
+#         # temp = temp[['S_INFO_WINDCODE', 'TRADE_DT', 'S_DQ_ADJCLOSE', 'S_DQ_TRADESTATUS']]
+#         df = pd.concat([df, temp]).reset_index(drop=True)
+#
+#     # 剔除ST、退市、上市终止等股票
+#     des = pd.read_hdf(r'AShareDescription.h5')
+#     indexnum = []
+#     for i in range(len(des)):
+#         if not ((re.match('.*ST.*', des.iloc[i]['S_INFO_NAME'])) or (
+#                 re.match('.*退市.*', des.iloc[i]['S_INFO_NAME'])) or (
+#                         re.match('.*终止.*', des.iloc[i]['S_INFO_NAME'])) or (
+#                         re.match('.*借壳.*', des.iloc[i]['S_INFO_NAME']))):
+#             indexnum.append(i)
+#     des = des.iloc[indexnum].reset_index(drop=True)
+#     df = df.merge(des, on='S_INFO_WINDCODE', how='left')
+#     df = df[df['S_INFO_NAME'].notnull()].reset_index(drop=True)
+#
+#     # # 剔除停牌股票
+#     # df = df[df['S_DQ_TRADESTATUS'] == '交易']
+#
+#     # 量价衍生数据
+#     datalist = os.listdir('ashareeodderivativeindicator')
+#     df1 = pd.DataFrame()
+#     for i in datalist:
+#         temp = pd.read_hdf('ashareeodderivativeindicator' + '\\' + i)
+#         df1 = pd.concat([df1, temp]).reset_index(drop=True)
+#     df1 = df1[
+#         ['S_INFO_WINDCODE', 'TRADE_DT', 'S_DQ_MV', 'S_VAL_PB_NEW', 'S_VAL_PE_TTM', 'S_VAL_PCF_OCFTTM', 'S_DQ_TURN']]
+#
+#     df = df.merge(df1, on=['TRADE_DT', 'S_INFO_WINDCODE'], how='left')
+#     df = df[df['TRADE_DT'] >= '20080101'].reset_index(drop=True)
+#     df.to_hdf('raw_data.h5', 'df')
+
+
+
+def get_n(series, n):
+    '''排名前n的资产'''
+    series = series.dropna()
+    series = series.rank(ascending=False)  # pd.qcut(series, 10, labels=False)
+    series = series[series <= n]
+    new_series = pd.Series([1 / n] * len(series), index=series.index)
+    return new_series
+
+
+def all_market(raw_data, index_raw_data, indname, n_assets=100, indexname='000905.SH', vTh=1, vfee=0):  # 中证全指 000985.CSI
+    # # 计算因子，raw_data是index为日期类型TRADE_DT，columns为资产序列S_INFO_WINDCODE，values为收盘价的宽型数据
+
+
+    # 日收益率
+    return_df = raw_data.pct_change(1)
+
+    '''1、按实际月末数据算'''
+
+    # 把月底数据提取出来
+    raw_data_month = raw_data.copy()
+    raw_data_month['month'] = raw_data_month.index.month
+    raw_data_month['month_tail'] = raw_data_month['month'].diff(-1)
+    month_list = raw_data_month[raw_data_month['month_tail'] != 0].index.to_list()  # 找月底数据
+    # raw_data_month['day_before_month_tail'] = raw_data_month['month'].diff(-2)
+    # raw_data_month['day_before_month_tail'] = raw_data_month['day_before_month_tail'] - raw_data_month[
+    #     'month_tail']  # 找月底前一天数据
+    # before_month_list = raw_data_month[raw_data_month['day_before_month_tail'] != 0].index.to_list()
+
+    # # 反转因子
+    std1m_df = pd.DataFrame()
+    for i in range(1, len(month_list)):
+        series = pd.Series(return_df.loc[month_list[i - 1]:month_list[i]].std() * np.sqrt(252))
+        series.name = month_list[i]
+        std1m_df = std1m_df.append(series)
+
+    std12m_df = pd.DataFrame()
+    for i in range(12, len(month_list)):
+        series = pd.Series(return_df.loc[month_list[i - 12]:month_list[i]].std() * np.sqrt(252))
+        series.name = month_list[i]
+        std12m_df = std12m_df.append(series)
+
+    std_df = (std1m_df / std12m_df).dropna(how='all')
+    std_df = np.where(std_df == 0, np.nan, std_df)
+    std_df = np.where(std_df >= vTh, np.nan, std_df)
+    std_df = pd.DataFrame(np.where(std_df < vTh, 1, std_df))
+    std_df.index = std12m_df.index
+    std_df.columns = std12m_df.columns
+    std_df = std_df.stack().reset_index()
+    std_df.rename(columns={0: 'std_ratio', 'level_1': 'S_INFO_WINDCODE', 'level_0': 'TRADE_DT'}, inplace=True)
+    # 保存
+    std_df1 = std_df.merge(indname, on='S_INFO_WINDCODE', how='left')
+    std_df1.to_excel(r'中信二级std.xlsx', index=False)
+    del std_df1
+
+    # # 动量因子
+    # 月度数据
+    m_raw_data = raw_data[raw_data.index.isin(month_list)].copy()
+
+    mon1m_df = (m_raw_data / m_raw_data.shift(1) - 1).dropna(how='all')
+    mon6m_df = (m_raw_data / m_raw_data.shift(6) - 1).dropna(how='all')
+    mon12m_df = (m_raw_data / m_raw_data.shift(12) - 1 - mon1m_df).dropna(how='all')
+
+    mon1m_df = mon1m_df.stack().reset_index()
+    mon1m_df.rename(columns={0: 'mon1m', 'level_1': 'S_INFO_WINDCODE'}, inplace=True)
+    mon1m_df = mon1m_df.merge(std_df, on=['TRADE_DT', 'S_INFO_WINDCODE'], how='right')
+    mon1m_df = mon1m_df.pivot_table(values='mon1m', index='TRADE_DT', columns='S_INFO_WINDCODE')
+    mon1m_df1 = mon1m_df.apply(lambda x: get_n(x, n_assets), axis=1)
+    mon1m_df1 = mon1m_df1.stack().reset_index()
+    mon1m_df1.rename(columns={0: 'mon1m', 'level_1': 'S_INFO_WINDCODE'}, inplace=True)
+    # 保存
+    mon1m_df2 = mon1m_df1.merge(indname, on='S_INFO_WINDCODE', how='left')
+    mon1m_df2.to_excel(r'中信二级mon1m.xlsx', index=False)
+    del mon1m_df2
+
+    mon6m_df = mon6m_df.stack().reset_index()
+    mon6m_df.rename(columns={0: 'mon6m', 'level_1': 'S_INFO_WINDCODE'}, inplace=True)
+    mon6m_df = mon6m_df.merge(std_df, on=['TRADE_DT', 'S_INFO_WINDCODE'], how='right')
+    mon6m_df = mon6m_df.pivot_table(values='mon6m', index='TRADE_DT', columns='S_INFO_WINDCODE')
+    mon6m_df1 = mon6m_df.apply(lambda x: get_n(x, n_assets), axis=1)
+    mon6m_df1 = mon6m_df1.stack().reset_index()
+    mon6m_df1.rename(columns={0: 'mon6m', 'level_1': 'S_INFO_WINDCODE'}, inplace=True)
+
+    mon6m_df2 = mon6m_df1.merge(indname, on='S_INFO_WINDCODE', how='left')
+    mon6m_df2.to_excel(r'中信二级mon6m.xlsx', index=False)
+    del mon6m_df2
+
+    mon12m_df = mon12m_df.stack().reset_index()
+    mon12m_df.rename(columns={0: 'mon12m', 'level_1': 'S_INFO_WINDCODE'}, inplace=True)
+    mon12m_df = mon12m_df.merge(std_df, on=['TRADE_DT', 'S_INFO_WINDCODE'], how='right')
+    mon12m_df = mon12m_df.pivot_table(values='mon12m', index='TRADE_DT', columns='S_INFO_WINDCODE')
+    mon12m_df1 = mon12m_df.apply(lambda x: get_n(x, n_assets), axis=1)
+    mon12m_df1 = mon12m_df1.stack().reset_index()
+    mon12m_df1.rename(columns={0: 'mon12m', 'level_1': 'S_INFO_WINDCODE'}, inplace=True)
+    # 保存
+    mon12m_df2 = mon12m_df1.merge(indname, on='S_INFO_WINDCODE', how='left')
+    mon12m_df2.to_excel(r'中信二级mon12m.xlsx', index=False)
+    del mon12m_df2
+
+    mon_df = mon1m_df1.merge(mon6m_df1, on=['TRADE_DT', 'S_INFO_WINDCODE'], how='outer')
+    mon_df = mon_df.merge(mon12m_df1, on=['TRADE_DT', 'S_INFO_WINDCODE'], how='outer')
+    # 保存
+    mon_df1 = mon_df.merge(indname, on='S_INFO_WINDCODE', how='left')
+    mon_df1.to_excel(r'中信二级mon.xlsx', index=False)
+    del mon_df1
+
+    # # 生成月末权重文件
+    weightdf = std_df.merge(mon_df, on=['TRADE_DT', 'S_INFO_WINDCODE'], how='left')
+    weightdf = weightdf.fillna(0)
+    weightdf['mon_ratio'] = (weightdf['mon1m'] + weightdf['mon6m'] + weightdf['mon12m']) / 3
+    weightdf = weightdf.merge(indname, on='S_INFO_WINDCODE', how='left')
+    weightdf.to_excel(r'中信二级' + str(n_assets) + '全部因子.xlsx', index=False)
+    weightdf = weightdf[(weightdf['TRADE_DT'] >= '20140731')].reset_index(
+        drop=True)
+    weightdf = weightdf.pivot_table(values='mon_ratio', index='TRADE_DT', columns='S_INFO_WINDCODE').fillna(0)
+
+    # '''2、按交易日期的区间算，20天、120天、240天'''
+    # # 过去1个月累积收益，过去6个月累积收益，过去12个月累积收益-过去1个月累积收益，分别取前n_stocks等权构建组合，之后再对三个组合做等权
+    # mon1m_df = (raw_data / raw_data.shift(20) - 1).dropna(how='all').resample('M').last()
+    # mon6m_df = (raw_data / raw_data.shift(120) - 1).dropna(how='all').resample('M').last()
+    # mon12m_df = (raw_data / raw_data.shift(240) - 1 - mon1m_df).dropna(how='all').resample('M').last()
+    #
+    # mon1m_df1 = mon1m_df.apply(lambda x: get_n(x, n_assets), axis=1)
+    # mon1m_df1 = mon1m_df1.stack().reset_index()
+    # mon1m_df1.rename(columns={0: 'mon1m', 'level_1': 'S_INFO_WINDCODE'}, inplace=True)
+    #
+    # mon6m_df1 = mon6m_df.apply(lambda x: get_n(x, n_assets), axis=1)
+    # mon6m_df1 = mon6m_df1.stack().reset_index()
+    # mon6m_df1.rename(columns={0: 'mon6m', 'level_1': 'S_INFO_WINDCODE'}, inplace=True)
+    #
+    # mon12m_df1 = mon12m_df.apply(lambda x: get_n(x, n_assets), axis=1)
+    # mon12m_df1 = mon12m_df1.stack().reset_index()
+    # mon12m_df1.rename(columns={0: 'mon12m', 'level_1': 'S_INFO_WINDCODE'}, inplace=True)
+    #
+    # mon_df = mon1m_df1.merge(mon6m_df1, on=['TRADE_DT', 'S_INFO_WINDCODE'], how='outer')
+    # mon_df = mon_df.merge(mon12m_df1, on=['TRADE_DT', 'S_INFO_WINDCODE'], how='outer')
+    #
+    # # 过去1个月波动率，过去12个月波动率，其比值 ≥vTh 时，剔除该股票
+    # std1m_df = (return_df.rolling(20).std() * np.sqrt(240)).dropna(how='all').resample('M').last()
+    # std12m_df = (return_df.rolling(240).std() * np.sqrt(240)).dropna(how='all').resample('M').last()
+    # std_df = (std1m_df / std12m_df).dropna(how='all')
+    # std_df = np.where(std_df == 0, np.nan, std_df)
+    # std_df = np.where(std_df >= vTh, np.nan, std_df)
+    # std_df = pd.DataFrame(np.where(std_df < vTh, 1, std_df))
+    # std_df.index = std12m_df.index
+    # std_df.columns = std12m_df.columns
+    # std_df = std_df.stack().reset_index()
+    # std_df.rename(columns={0: 'std_ratio', 'level_1': 'S_INFO_WINDCODE'}, inplace=True)
+    #
+    # # # 生成月末权重文件
+    # weightdf = std_df.merge(mon_df, on=['TRADE_DT', 'S_INFO_WINDCODE'], how='outer')
+    # weightdf = weightdf.fillna(0)
+    # weightdf['mon_ratio'] = (weightdf['mon1m'] + weightdf['mon6m'] + weightdf['mon12m']) / 3
+    # weightdf = weightdf[(weightdf['mon_ratio'] != 0) & (weightdf['TRADE_DT'] >= mon12m_df.index[0])].reset_index(
+    #     drop=True)
+    # weightdf = weightdf.pivot_table(values='mon_ratio', index='TRADE_DT', columns='S_INFO_WINDCODE').fillna(0)
+
+    # #手续费
+    # dailycost=weightdf.fillna(0).diff().apply(abs).sum(axis=1)  # 将weightdf后一天减前一天，结果进行绝对值操作然后每天进行加和生成一个Series dailycost
+    # dailycost.iloc[0]=1  # dailycost第一天设为1
+    # dailycost=dailycost.reindex(list(return_df.index)).shift(1).fillna(0)
+    # dailycost.drop(dailycost.index[0],inplace=True)  # 月频变为日频 往后挪一天 并删掉为nan值的第一行
+    weightdf = weightdf.reindex(list(return_df.index), method='pad').shift(1).dropna(how='all').fillna(0)
+    returndf = (weightdf * return_df[return_df.index.isin(weightdf.index)]).sum(
+        axis=1)  # - dailycost * vfee  # 日收益减去手续费 constantcost一般设为千分之二
+    returndf.iloc[0] = 0
+    returndf.to_excel(r'中信二级return' + str(n_assets) + '.xlsx')
+    index_returndf = index_raw_data[indexname].pct_change(1)
+    index_returndf.index = pd.to_datetime(index_returndf.index)
+    index_returndf = index_returndf[index_returndf.index.isin(returndf.index)]
+    index_returndf.iloc[0] = 0
+
+    return returndf, index_returndf
+
+
+def testreturn(Return):
+    '''计算绝对收益的各种指标：年化收益 ,年化标准差 ,夏普比率 ,最大回撤 ,胜率'''
+    value = np.cumprod(1 + Return)  # 净值序列
+    ar = round((250 * Return.mean()), 2)  # 年化收益率
+    std = round((np.sqrt(250) * Return.std()), 2)  # 年化标准差
+    sr = round((ar / std), 2)  # 夏普比率
+    wp = round(((Return > 0).sum() / len(Return)), 2)  # 胜率
+    md = round((np.min(value / value.cummax()) - 1), 2)  # 最大回撤
+    print('绝对： 年化收益：%s ,年化标准差：%s ,夏普比率：%s ,最大回撤：%s ,胜率：%s' % (ar, std, sr, md, wp))
+    return [ar, std, sr, md, wp]
+
+
+def testabove(Return, benchmark):
+    '''计算超额收益的各种指标：年化收益 ,年化标准差 ,夏普比率 ,最大回撤 ,胜率'''
+    above = Return - benchmark  # 超额收益序列
+    ar = round((250 * above.mean()), 2)  # 年化收益率
+    std = round((np.sqrt(250) * above.std()), 2)  # 年化标准差
+    ir = round((ar / std), 2)  # 信息比率
+    wp = round(((above > 0).sum() / len(above)), 2)  # 胜率
+    print('超额： 超额年化收益：%s ,超额年化标准差：%s ,信息比率：%s ,胜率：%s' % (ar, std, ir, wp))
+    return [ar, std, ir, wp]
+
+
+'''
+# # 个股
+raw_data = pd.read_hdf(r'raw_data.h5')
+raw_data = raw_data.pivot_table(values='S_DQ_ADJCLOSE', index='TRADE_DT', columns='S_INFO_WINDCODE')
+raw_data.index = pd.to_datetime(raw_data.index)
+index_raw_data = pd.read_hdf(r'index_raw_data.h5')
+
+for n in [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]:
+    print(n)
+    returndf, index_returndf = all_market(raw_data=raw_data.copy(), indexname='000300.SH', n_stocks=n, vTh=1)
+    testreturn(returndf)
+    testabove(returndf, index_returndf)
+
+indexname = '000905.SH'
+for n in [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]:
+    Return = pd.read_excel(r'return' + str(n) + '.xlsx', index_col=0)
+    index_returndf = index_raw_data[indexname].pct_change(1)
+    index_returndf.index = pd.to_datetime(index_returndf.index)
+    index_returndf = index_returndf[index_returndf.index.isin(Return.index)]
+    index_returndf.iloc[0] = 0
+    value1 = np.cumprod(1 + Return)  # 组合净值序列
+    value2 = np.cumprod(1 + index_returndf)  # 基准净值序列
+    df = pd.DataFrame({'组合净值': value1[0], indexname + '净值': value2})
+'''
+
+'''行业指数效果'''
+# # 行业收盘价
+raw_data = pd.read_excel(r'中信二级raw_data.xlsx', sheet_name='指数价格', index_col=0)
+# # 行业信息
+indname = pd.read_excel(r'中信二级raw_data.xlsx', sheet_name='行业信息')
+# # 基准指数
+index_raw_data = pd.read_hdf(r'index_raw_data.h5')
