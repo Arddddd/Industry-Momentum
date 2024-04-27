@@ -1,0 +1,308 @@
+import pandas as pd
+import cx_Oracle
+import os
+import datetime
+import numpy as np
+from dateutil.relativedelta import relativedelta
+import matplotlib.pyplot as plt
+
+
+# 连接数据库函数
+def query(sentence):
+    os.environ['NLS_LANG'] = 'SIMPLIFIED CHINESE_CHINA.UTF8'
+    host = "10.5.104.11"  # 数据库ip
+    port = "1521"  # 端口
+    sid = "windzx"  # 数据库名称
+    dsn = cx_Oracle.makedsn(host, port, sid)
+    conn = cx_Oracle.connect("hsl_readonly", "At#2020gRs#sac9132", dsn)
+    sql = sentence
+    results = pd.read_sql(sql, conn)
+    conn.close()
+    return results
+
+
+# 计算累计收益函数
+def accumReturn(Asset_nav):
+    return float(Asset_nav[len(Asset_nav) - 1] / Asset_nav[0] - 1)
+
+
+# 计算年化收益函数
+def annReturn(Asset_nav, annual_day=250):
+    during_day = len(Asset_nav)
+    annual_rate = (Asset_nav[len(Asset_nav) - 1] / Asset_nav[0]) ** (annual_day / during_day) - 1
+    return float(annual_rate)
+
+
+# 计算年化波动率
+def volatility(Asset_nav, annual_day=250):
+    ret = (Asset_nav[1:len(Asset_nav)] - Asset_nav[0:(len(Asset_nav) - 1)]) / Asset_nav[0:(len(Asset_nav) - 1)]
+    volatility = np.std(ret) * np.sqrt(annual_day)
+    return float(volatility)
+
+
+# 计算年化夏普
+def sharpRatio(Asset_nav, annual_day=250):
+    return float(annReturn(Asset_nav, annual_day) / volatility(Asset_nav, annual_day))
+
+
+# 计算最大回撤
+def max_drawdown(Asset_nav):
+    acc_max = np.maximum.accumulate(Asset_nav)
+    max_drawdown = np.max((acc_max - Asset_nav) / acc_max)
+    return float(max_drawdown)
+
+
+# 单因子的IC，IR分析
+def IC_RIC(data, factor, vReturn):
+    date_arr = data['Date'].unique()
+    COR_df = pd.DataFrame()
+    for dt in date_arr:
+        Tmp_cor_pearson = data[data['Date'] == dt][[factor, vReturn]].corr('pearson')
+        Tmp_cor_spearman = data[data['Date'] == dt][[factor, vReturn]].corr('spearman')
+        tmp_COR_df = pd.DataFrame([dt, Tmp_cor_pearson[factor][vReturn], Tmp_cor_spearman[factor][vReturn], factor]).T
+        tmp_COR_df.columns = ['TRADE_DT', 'IC', 'RIC', 'fact']
+        COR_df = COR_df.append(pd.DataFrame(tmp_COR_df))
+    return COR_df
+
+
+# 单因子的IC，IR走势图
+def IC_RIC_plot(data, factor):
+    fig, ax = plt.subplots(figsize=(16, 8))
+    plt.xticks(rotation=45)
+    n = len(data[data['fact'] == factor])
+    plt.bar(np.arange(n), np.array(data[data['fact'] == factor]['IC']), 0.35, alpha=0.9)
+    plt.bar(np.arange(n) + 0.35, np.array(data[data['fact'] == factor]['RIC']), 0.35, alpha=0.9)
+    plt.xticks([])
+    x_axis_data = np.array(data['TRADE_DT'].astype(str).unique())
+    plt.xticks(range(0, len(x_axis_data), 10), x_axis_data[np.array(range(0, len(x_axis_data), 10))])
+    plt.legend(['IC', 'RIC'], loc=1, title='legend')
+    plt.xlabel('Date')
+    plt.ylabel('Value')
+    plt.show()
+
+
+# 回测函数
+def Backtest(Hold_df, price_table, vfee=0.0003):
+    start_nav = 1
+    vData = Hold_df
+    Date_arr = vData['Date'].unique()
+    nav = pd.DataFrame()
+    for i_date in Date_arr:
+        tmp_vData = vData[vData['Date'] == i_date]
+        tmp_date = Date_arr[Date_arr > i_date]
+        if len(tmp_date) > 0:
+            end_date = tmp_date[0]
+        else:
+            end_date = datetime.datetime.now()
+        tmp_price = price_table[(price_table.index > i_date) & (price_table.index <= end_date)][
+            tmp_vData['S_INFO_WINDCODE']]
+        for j_name in tmp_vData['S_INFO_WINDCODE']:
+            tmp_price[j_name] = tmp_price[j_name] / (tmp_price[j_name][0])
+        tmp_nav = np.dot(tmp_price.values, tmp_vData['Weight']) * start_nav * (1 - vfee)
+        start_nav = tmp_nav[len(tmp_nav) - 1]
+        tmp_nav_df = pd.DataFrame(tmp_nav, index=tmp_price.index)
+        tmp_nav_df.columns = ['Nav']
+        nav = nav.append(tmp_nav_df)
+    return nav
+
+
+'''参数设置'''
+
+vPeriod = "month"  # 调仓周期：week周频，month月频，quarter季频，halfyear半年
+n_asset = 4  # 单策略每期持仓数量
+StartDT = "2014-07-31"  # 回测开始时间
+
+'''数据提取'''
+# 提取行业收盘价数据
+sql_cmd = "select S_INFO_WINDCODE,TRADE_DT,S_DQ_CLOSE FROM AIndexWindIndustriesEOD" \
+          " where S_INFO_WINDCODE in (select S_INFO_WINDCODE from AIndexDescription " \
+          "where S_INFO_NAME like '%中信%'and S_INFO_INDEXSTYLE like '二级行业指数') order by TRADE_DT"
+price_data = query(sql_cmd)
+price_data.TRADE_DT = pd.to_datetime(price_data.TRADE_DT)
+price_data.head()
+price_data.columns = ["S_INFO_WINDCODE", "Date", "Price"]
+price_table = price_data.pivot(values='Price', columns='S_INFO_WINDCODE', index='Date')  # 宽型数据
+price_table = price_table.fillna(method='bfill')  # 向前填充
+price_table = price_table.fillna(method='ffill')  # 向后填充
+price_table['Cash'] = 1
+
+'''数据预处理'''
+# 获得调仓日期数据
+if vPeriod == "week":
+    Date_arr = price_data['Date'].astype(str).unique()
+    Hold_date = []
+    s_date = Date_arr[0]
+    Hold_date.append(s_date)
+    for i in range(len(Date_arr) - 2):
+        if (pd.to_datetime(Date_arr[i]) - pd.to_datetime(s_date)).days >= 7:
+            Hold_date.append(Date_arr[i])
+            s_date = Date_arr[i]
+
+if vPeriod == "month":
+    Date_arr = price_data['Date'].astype(str).unique()
+    Hold_date = []
+    for i in range(len(Date_arr) - 2):
+        if (Date_arr[i][0:7] != Date_arr[i + 1][0:7]):
+            Hold_date.append(Date_arr[i])
+
+if vPeriod == "quarter":
+    Date_arr = price_data['Date'].astype(str).unique()
+    tmp_Hold_date = []
+    for i in range(len(Date_arr) - 2):
+        if (Date_arr[i][0:7] != Date_arr[i + 1][0:7]):
+            tmp_Hold_date.append(Date_arr[i + 1])
+    Hold_date = []
+    s_date = tmp_Hold_date[0]
+    Hold_date.append(s_date)
+    for i in range(len(tmp_Hold_date) - 2):
+        if (pd.to_datetime(tmp_Hold_date[i]) - pd.to_datetime(s_date)).days >= 65:
+            Hold_date.append(tmp_Hold_date[i])
+            s_date = tmp_Hold_date[i]
+
+if vPeriod == "halfyear":
+    Date_arr = price_data['Date'].astype(str).unique()
+    tmp_Hold_date = []
+    for i in range(len(Date_arr) - 2):
+        if (Date_arr[i][0:7] != Date_arr[i + 1][0:7]):
+            tmp_Hold_date.append(Date_arr[i + 1])
+    Hold_date = []
+    s_date = tmp_Hold_date[0]
+    Hold_date.append(s_date)
+    for i in range(len(tmp_Hold_date) - 2):
+        if (pd.to_datetime(tmp_Hold_date[i]) - pd.to_datetime(s_date)).days >= 175:
+            Hold_date.append(tmp_Hold_date[i])
+            s_date = tmp_Hold_date[i]
+
+# 计算过去一月，六月，十二月收益，波动率
+price_data['OneMonreturn'] = ''
+price_data['SixMonreturn'] = ''
+price_data['TwelveMonreturn'] = ''
+price_data['OneMonStd'] = ''
+price_data['SixMonStd'] = ''
+price_data['TwelveMonStd'] = ''
+industry = price_data['S_INFO_WINDCODE'].unique()
+for i_industry in industry:
+    Tmp = price_data[price_data['S_INFO_WINDCODE'] == i_industry]
+    # print(i_industry)
+    for i_date in pd.to_datetime(Hold_date):
+        end_date_1 = i_date + relativedelta(months=-1)
+        end_date_2 = i_date + relativedelta(months=-6)
+        end_date_3 = i_date + relativedelta(months=-12)
+        nav_1 = Tmp[Tmp['Date'] < i_date][Tmp['Date'] >= end_date_1]['Price'].values
+        nav_2 = Tmp[Tmp['Date'] < i_date][Tmp['Date'] >= end_date_2]['Price'].values
+        nav_3 = Tmp[Tmp['Date'] < i_date][Tmp['Date'] >= end_date_3]['Price'].values
+        if len(nav_1) > 0:
+            price_data.loc[
+                (price_data['S_INFO_WINDCODE'] == i_industry) & (Tmp['Date'] == i_date), 'OneMonreturn'] = accumReturn(
+                nav_1)
+            price_data.loc[
+                (price_data['S_INFO_WINDCODE'] == i_industry) & (Tmp['Date'] == i_date), 'SixMonreturn'] = accumReturn(
+                nav_2)
+            price_data.loc[(price_data['S_INFO_WINDCODE'] == i_industry) & (
+                    Tmp['Date'] == i_date), 'TwelveMonreturn'] = accumReturn(nav_3)
+            price_data.loc[
+                (price_data['S_INFO_WINDCODE'] == i_industry) & (Tmp['Date'] == i_date), 'OneMonStd'] = volatility(
+                nav_1)
+            price_data.loc[
+                (price_data['S_INFO_WINDCODE'] == i_industry) & (Tmp['Date'] == i_date), 'SixMonStd'] = volatility(
+                nav_2)
+            price_data.loc[
+                (price_data['S_INFO_WINDCODE'] == i_industry) & (Tmp['Date'] == i_date), 'TwelveMonStd'] = volatility(
+                nav_3)
+
+any_data = price_data[price_data['OneMonreturn'] != '']
+any_data['OneMonreturn'] = pd.to_numeric(any_data['OneMonreturn'])
+any_data['SixMonreturn'] = pd.to_numeric(any_data['SixMonreturn'])
+any_data['TwelveMonreturn'] = pd.to_numeric(any_data['TwelveMonreturn'])
+any_data['OneMonStd'] = pd.to_numeric(any_data['OneMonStd'])
+any_data['SixMonStd'] = pd.to_numeric(any_data['SixMonStd'])
+any_data['TwelveMonStd'] = pd.to_numeric(any_data['TwelveMonStd'])
+any_data["LongMonreturn"] = any_data['TwelveMonreturn'] - any_data['OneMonreturn']
+any_data = any_data[any_data['TwelveMonStd'] > any_data['OneMonStd']]
+any_data = any_data[any_data['Date'] >= StartDT]
+
+any_data['OneMonreturnRank'] = ""
+any_data['SixMonreturnRank'] = ""
+any_data['TwelveMonreturnRank'] = ""
+for i_Date in any_data['Date'].unique():
+    tmp_any = any_data[any_data['Date'] == i_Date]
+    any_data.loc[any_data['Date'] == i_Date, 'OneMonreturnRank'] = tmp_any['OneMonreturn'].rank(ascending=0,
+                                                                                                method='max')
+    any_data.loc[any_data['Date'] == i_Date, 'SixMonreturnRank'] = tmp_any['SixMonreturn'].rank(ascending=0,
+                                                                                                method='max')
+    any_data.loc[any_data['Date'] == i_Date, 'TwelveMonreturnRank'] = tmp_any['LongMonreturn'].rank(ascending=0,
+                                                                                                    method='max')
+'''模型建立'''
+hold_data = any_data[(any_data['OneMonreturnRank'] <= n_asset) | (any_data['SixMonreturnRank'] <= n_asset) | (
+        any_data['TwelveMonreturnRank'] <= n_asset)]
+hold_data['OneMonreturn_weight'] = 0
+hold_data['SixMonreturn_weight'] = 0
+hold_data['TwelveMonreturn_weight'] = 0
+for i_Date in hold_data['Date'].unique():
+    tmp = hold_data[hold_data['Date'] == i_Date]
+    tmp_code = tmp[tmp['OneMonreturnRank'] <= n_asset]['S_INFO_WINDCODE']
+    hold_data.loc[
+        (hold_data['S_INFO_WINDCODE'].isin(tmp_code)) & (hold_data['Date'] == i_Date), 'OneMonreturn_weight'] = 1 / len(
+        tmp_code)
+    tmp_code = tmp[tmp['SixMonreturnRank'] <= n_asset]['S_INFO_WINDCODE']
+    hold_data.loc[
+        (hold_data['S_INFO_WINDCODE'].isin(tmp_code)) & (hold_data['Date'] == i_Date), 'SixMonreturn_weight'] = 1 / len(
+        tmp_code)
+    tmp_code = tmp[tmp['TwelveMonreturnRank'] <= n_asset]['S_INFO_WINDCODE']
+    hold_data.loc[(hold_data['S_INFO_WINDCODE'].isin(tmp_code)) & (
+            hold_data['Date'] == i_Date), 'TwelveMonreturn_weight'] = 1 / len(tmp_code)
+hold_data['Weight'] = hold_data[['OneMonreturn_weight', 'SixMonreturn_weight', 'TwelveMonreturn_weight']].mean(axis=1)
+weight_data = hold_data[['S_INFO_WINDCODE', 'Date', 'Weight']]
+s_Hold_date = pd.to_datetime(Hold_date)
+s_Hold_date = s_Hold_date[s_Hold_date >= StartDT]
+
+for i_date in s_Hold_date:
+    if len(weight_data[weight_data['Date'] == i_date]) == 0:
+        tmp_df = pd.DataFrame(["Cash", i_date, 1]).T
+        tmp_df.columns = ['S_INFO_WINDCODE', 'Date', 'Weight']
+        weight_data = weight_data.append(tmp_df)
+weight_data = weight_data.sort_values(by='Date')
+
+'''计算基准'''
+# 等权计算基准
+benckmark_df = price_data[['S_INFO_WINDCODE', 'Date', 'Price']]
+benckmark_df['Weight'] = ""
+for i_date in s_Hold_date:
+    benckmark_df.loc[benckmark_df['Date'] == i_date, 'Weight'] = 1 / len(benckmark_df[benckmark_df['Date'] == i_date])
+benckmark_df = benckmark_df[benckmark_df['Date'] >= StartDT]
+benckmark_df = benckmark_df[benckmark_df['Weight'] != ""]
+
+'''模型回测和评价'''
+nav = Backtest(weight_data, price_table, vfee=0.0000001)
+benckmark_nav = Backtest(benckmark_df, price_table, vfee=0.0000001)
+plt.figure(figsize=(20, 10))
+plt.plot(nav.values)
+plt.plot(benckmark_nav.values)
+plt.legend(['Avg', 'benckmark'], loc="upper left")
+plt.xticks([])
+x_axis_data = np.array(nav.index.astype(str).unique())
+plt.xticks(range(0, len(x_axis_data), 300), x_axis_data[np.array(range(0, len(x_axis_data), 300))])
+plt.xlabel('Date')
+plt.ylabel('Value')
+plt.show()
+
+Eva = [["策略", accumReturn(nav.values), annReturn(nav.values, annual_day=250), volatility(nav.values, annual_day=250),
+        sharpRatio(nav.values, annual_day=250), max_drawdown(nav.values)],
+       ["基准", accumReturn(benckmark_nav.values), annReturn(benckmark_nav.values, annual_day=250),
+        volatility(benckmark_nav.values, annual_day=250), sharpRatio(benckmark_nav.values, annual_day=250),
+        max_drawdown(benckmark_nav.values)]
+       ]
+Eva = pd.DataFrame(Eva)
+Eva.columns = ['Group', 'accumReturn', 'annReturn', 'volatility', 'sharpRatio', 'max_drawdown']
+print(Eva)
+
+# 计算每年收益
+Year_start = []
+Year_end = int(str(max(nav.index))[0:4])
+for i in range(Year_end - int(StartDT[0:4]) + 2):
+    Year_start = Year_start + [(str(int(StartDT[0:4]) + i) + "-01-01")]
+for i_start in pd.to_datetime(Year_start):
+    if (len(pd.to_datetime(Year_start)[pd.to_datetime(Year_start) > i_start]) > 0):
+        e_data = pd.to_datetime(Year_start)[pd.to_datetime(Year_start) > i_start][0]
+        print(annReturn(nav[(nav.index > i_start) & (nav.index < e_data)].values),
+              annReturn(benckmark_nav[(benckmark_nav.index > i_start) & (benckmark_nav.index < e_data)].values))
